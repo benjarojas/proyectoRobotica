@@ -1,7 +1,15 @@
 #include <MQUnifiedsensor.h>
-#include <ArduinoJson.h>
 #include <SoftwareSerial.h>
 #include <DHT.h>
+#include <NewPing.h>
+
+// motores
+int motor1pin1 = 2;
+int motor1pin2 = 3;
+int motor2pin1 = 4;
+int motor2pin2 = 5;
+int enableMotor1 = 9;
+int enableMotor2 = 10;
 
 // constantes y objeto sensor MQ-135
 #define board "Arduino UNO"
@@ -16,7 +24,7 @@ float CO2 = 0; // dioxido de carbono
 float Toluene = 0; // tolueno
 float NH4 = 0; // amonio
 float Acetone = 0; // acetona
-MQUnifiedsensor MQ1 35(board, Voltage_Resolution, ADC_Bit_Resolution, mqPin, type);
+MQUnifiedsensor MQ135(board, Voltage_Resolution, ADC_Bit_Resolution, mqPin, type);
 
 // módulo bluetooth
 // Arduino RX (A4) <- Module TX
@@ -26,14 +34,13 @@ SoftwareSerial bluetooth(18,19); // A4, A5
 // pines sensor ultrasonido
 #define TRIGGER_PIN  15 // A1
 #define ECHO_PIN     14 // A0
+#define MAX_DISTANCE 200
+NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
 
 // sensor temperatura y humedad
 #define DHTPIN 2 // D2
 #define DHTTYPE DHT11
 DHT dht(DHTPIN, DHTTYPE);
-
-// json que se enviará a la aplicación
-JsonDocument sensors;
 
 // variables para timing
 unsigned long startMillisDht;
@@ -45,9 +52,22 @@ unsigned long currentMillis;
 // prototipos funciones
 void dhtMeasure(float *);
 void gasMeasure();
-long readDistance(int, int);
+void setSpeedMotor1(int);
+void setSpeedMotor2(int);
+void forward();
+void backward();
+void turn_right();
+void turn_left();
 
 void setup() {
+    // motores
+    pinMode(motor1pin1, OUTPUT);
+    pinMode(motor1pin2, OUTPUT);
+    pinMode(motor2pin1, OUTPUT);
+    pinMode(motor2pin2, OUTPUT);
+    pinMode(enableMotor1, OUTPUT);
+    pinMode(enableMotor2, OUTPUT);
+  
     // variables para timing
     startMillisDht = millis();
     startMillisDist = millis();
@@ -59,8 +79,7 @@ void setup() {
 
     // modelo matemático para calcular la concentracion de ppm
     MQ135.setRegressionMethod(1);
-    MQ135.setA(102.2);
-    MQ135.setB(-2.473);
+    MQ135.setA(102.2); MQ135.setB(-2.473);
     MQ135.init();
     
     pinMode(TRIGGER_PIN, OUTPUT); 
@@ -69,20 +88,10 @@ void setup() {
     pinMode(DHTPIN, INPUT);
     dht.begin();
 
-    // calibración del sensor MQ-135
-    float calcR0 = 0;
-    for(int i = 1; i<=10; i ++)
-    {
-      MQ135.update(); // actualizamos los datos, arduino leerá el voltage en el pin analógico
-      calcR0 += MQ135.calibrate(RatioMQ135CleanAir);
-    }
-    MQ135.setR0(calcR0/10);
-  
-    if(isinf(calcR0)) {Serial.println("R0 es infinito, revisar conexiones y fuente de alimentación"); while(1);}
-    if(calcR0 == 0){Serial.println("R0 es 0, revisar conexiones y fuente de alimentación"); while(1);}
+    MQ135.setR0(148.45/10);
 }
 
-float dhtArray[3] = {0,0,0};
+float dhtArray[2] = {0,0};
 long distance = 0;
 
 void loop() {
@@ -97,7 +106,7 @@ void loop() {
   // leemos la distancia cada 500 milisegundos
   if(currentMillis-startMillisDist >= 500)
   {
-    distance = readDistance(TRIGGER_PIN, ECHO_PIN);
+    distance = sonar.ping_cm();
     startMillisDist = millis();
   }
 
@@ -108,28 +117,12 @@ void loop() {
     startMillisGas = millis();
   }
 
-  // enviaremos las lecturas de los sensores en formato json cada 300 milisegundos mediante el puerto serial
+  // enviaremos las lecturas de los sensores en formato json cada 300 milisegundos mediante el módulo Bluetooth HC05
   if(currentMillis-startMillisJson >= 300)
   {
-    sensors["sensores"]["temperatura"]["unidad"] = "celsius";
-    sensors["sensores"]["temperatura"]["valor"] = dhtArray[1];
-    sensors["sensores"]["humedad"]["unidad"] = "Porcentaje";
-    sensors["sensores"]["humedad"]["valor"] = dhtArray[0];
-    sensors["sensores"]["CO"]["unidad"] = "ppm";
-    sensors["sensores"]["CO"]["valor"] = CO;
-    sensors["sensores"]["CO2"]["unidad"] = "ppm";
-    sensors["sensores"]["CO2"]["valor"] = CO2;
-    sensors["sensores"]["alcohol"]["unidad"] = "ppm";
-    sensors["sensores"]["alcohol"]["valor"] = Alcohol;
-    sensors["sensores"]["NH4"]["unidad"] = "ppm";
-    sensors["sensores"]["NH4"]["valor"] = NH4;
-    sensors["sensores"]["acetona"]["unidad"] = "ppm ";
-    sensors["sensores"]["acetona"]["valor"] = Acetone;
-    sensors["sensores"]["tolueno"]["unidad"] = "ppm";
-    sensors["sensores"]["tolueno"]["valor"] = Toluene;
-    sensors["sensores"]["distancia"]["unidad"] = "cm";
-    sensors["sensores"]["distancia"]["valor"] = distance;
-    serializeJsonPretty(sensors, Serial);
+    String sensorValues = (String) "hmd:"+dhtArray[0]+",tmp:"+dhtArray[1]+",CO:"+CO+",alc:"+Alcohol+",CO2:"+CO2+",tol:"+Toluene+",NH4:"+NH4+",ace:"+Acetone;
+    bluetooth.print(sensorValues);
+    bluetooth.print(";"); // separador de mensajes
     startMillisJson = millis();
   }
 }
@@ -161,7 +154,6 @@ void dhtMeasure(float *arr)
   // humidity and temp
   float h = dht.readHumidity();
   float t = dht.readTemperature();
-
   if(isnan(h) || isnan(t))
   { 
     // llenamos el array con -1 para debug
@@ -170,28 +162,31 @@ void dhtMeasure(float *arr)
     arr[2] = -1;
     return;
   }
-
-  // indice de calor
-  float hic = dht.computeHeatIndex(t, h, false);
-
   // llenamos el array
   arr[0] = h;
   arr[1] = t;
-  arr[2] = hic;
 }
 
-long readDistance(int trigger, int echo) {
-  long duration; // tiempo que demora en llegar la onda emitida 
-  long distance; // distancia en centimetros
+void setSpeedMotor1(int speed){
+  analogWrite(enableMotor1, speed);
+}
 
-  // medición según datasheet del sensor
-  digitalWrite(trigger, LOW); 
-  delayMicroseconds(2); 
-  digitalWrite(trigger, HIGH); 
-  delayMicroseconds(10); 
-  digitalWrite(trigger, LOW); 
- 
-  duration = pulseIn(echo, HIGH); // obtenemos la duración del viaje del pulso
-  distance = (duration * 0.0343) / 2; // convertimos a centimetros
-  return distance; 
+void setSpeedMotor2(int speed){
+  analogWrite(enableMotor2, speed);  
+}
+
+void forward(){
+  digitalWrite(motor1pin1, HIGH);
+  digitalWrite(motor1pin2, LOW);
+
+  digitalWrite(motor2pin1, HIGH);
+  digitalWrite(motor2pin2, LOW);
+}
+
+void backward(){
+  digitalWrite(motor1pin1, LOW);
+  digitalWrite(motor1pin2, HIGH);
+
+  digitalWrite(motor2pin1, LOW);
+  digitalWrite(motor2pin2, HIGH);
 }
